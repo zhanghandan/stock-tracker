@@ -20,19 +20,23 @@ CST = ZoneInfo("Asia/Shanghai")
 def _fetch_history_sync(code: str, period: str = "daily", days: int = HISTORY_DAYS) -> pd.DataFrame | None:
     """同步获取单只股票历史K线"""
     import akshare as ak
+    from datetime import timedelta
+
     try:
         # 根据股票代码判断市场
         if code.startswith("6"):
-            symbol = code
             adjust = "qfq"  # 前复权
         else:
-            symbol = code
+            adjust = "qfq"
+
+        end_date = datetime.now(CST).date()
+        start_date = (end_date - timedelta(days=days + 10)).isoformat()  # 多拿10天，含非交易日
 
         df = ak.stock_zh_a_hist(
-            symbol=symbol,
+            symbol=code,
             period=period,
-            start_date=(datetime.now(CST).date().isoformat()),
-            end_date=datetime.now(CST).date().isoformat(),
+            start_date=start_date,
+            end_date=end_date.isoformat(),
             adjust=adjust
         )
 
@@ -177,3 +181,61 @@ async def load_history_to_cache(codes: list[str]) -> dict[str, pd.DataFrame]:
 
     logger.info(f"历史数据缓存加载完成: {len(history_cache)} 只")
     return history_cache
+
+
+async def seed_history_for_codes(codes: list[str], max_concurrent: int = 8, days: int = 60):
+    """
+    为指定股票列表获取并保存历史K线数据
+    用于首次启动或增量补充
+    """
+    import asyncio
+
+    # 先检查哪些股票已有历史数据
+    existing_codes = set()
+    async with async_session() as session:
+        # SQLite不支持数组参数，分批查询
+        for i in range(0, len(codes), 100):
+            batch = codes[i:i + 100]
+            placeholders = ",".join([f"'{c}'" for c in batch])
+            result = await session.execute(
+                text(f"SELECT DISTINCT code FROM stock_daily WHERE code IN ({placeholders})")
+            )
+            existing_codes.update(row[0] for row in result.fetchall())
+
+    missing_codes = [c for c in codes if c not in existing_codes]
+    if not missing_codes:
+        logger.info(f"所有 {len(codes)} 只候选股已有历史数据")
+        return 0
+
+    logger.info(f"需要获取 {len(missing_codes)} 只股票的历史数据...")
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    fetched = 0
+
+    async def fetch_and_save(code: str):
+        nonlocal fetched
+        async with semaphore:
+            df = await asyncio.to_thread(_fetch_history_sync, code, "daily", days)
+            if df is not None and not df.empty:
+                await save_history_to_db(code, df)
+                # 同时加载到内存缓存
+                from backend.utils.cache import history_cache
+                column_mapping = {
+                    "日期": "trade_date", "开盘": "open", "收盘": "close",
+                    "最高": "high", "最低": "low", "成交量": "volume",
+                    "成交额": "amount", "振幅": "amplitude",
+                    "涨跌幅": "change_pct", "涨跌额": "change_amt",
+                    "换手率": "turnover_rate",
+                }
+                df_renamed = df.rename(columns=column_mapping)
+                history_cache[code] = df_renamed
+                fetched += 1
+                return 1
+            return 0
+
+    tasks = [fetch_and_save(code) for code in missing_codes]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    success = sum(r for r in results if isinstance(r, int))
+    logger.info(f"历史数据种子完成: {success}/{len(missing_codes)} 只 (新获取)")
+    return success

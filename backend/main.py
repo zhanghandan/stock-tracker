@@ -3,16 +3,19 @@ A股高价值股实时追踪系统 - FastAPI主入口
 """
 import os
 import sys
+import io
+import struct
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from backend.config import FRONTEND_DIST, LOG_LEVEL, SERVER_PORT
+from backend.config import DATA_DIR, FRONTEND_DIST, LOG_LEVEL, SERVER_PORT
 from backend.database import init_db
 from backend.api.router import router
 from backend.api.websocket import ws_endpoint
@@ -60,6 +63,12 @@ async def lifespan(app: FastAPI):
     # 启动调度器
     setup_scheduler()
     logger.info("Scheduler started (realtime tracking during trading hours)")
+
+    # 生成PWA图标（首次启动）
+    try:
+        _ensure_pwa_icons()
+    except Exception as e:
+        logger.warning(f"生成PWA图标失败（非致命）: {e}")
 
     yield
 
@@ -159,7 +168,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-title" content="股票追踪">
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="apple-touch-icon" href="/favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-192.png">
 <style>
 :root {
   --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
@@ -180,13 +189,13 @@ body{
 
 /* === Header === */
 .header{
-  background:var(--bg-card);padding:10px 16px;
+  background:var(--bg-card);padding:8px 16px;
   border-bottom:1px solid var(--border);
-  display:flex;justify-content:space-between;align-items:center;
-  position:sticky;top:0;z-index:100;gap:8px;
+  position:sticky;top:0;z-index:100;
 }
+.header-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .header h1{color:var(--accent);font-size:16px;white-space:nowrap}
-.header-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.header-right{display:flex;align-items:center;gap:6px;flex-shrink:0}
 .status-badge{
   display:flex;align-items:center;gap:4px;font-size:11px;
   background:#21262d;padding:3px 8px;border-radius:10px;white-space:nowrap;
@@ -195,7 +204,18 @@ body{
 .dot.green{background:#3fb950;box-shadow:0 0 4px #3fb950}
 .dot.red{background:#f85149;box-shadow:0 0 4px #f85149}
 .dot.yellow{background:#d2991d;box-shadow:0 0 4px #d2991d}
-#updateTime{font-size:10px;color:var(--text-muted);display:none}
+.header-status{display:flex;justify-content:space-between;align-items:center;margin-top:4px}
+#updateTime{font-size:10px;color:var(--text-muted)}
+#dataFreshness{font-size:10px;padding:2px 6px;border-radius:4px}
+#dataFreshness.fresh{color:#3fb950}
+#dataFreshness.stale{color:#d2991d}
+#dataFreshness.error{color:#f85149}
+#refreshBtn{
+  background:var(--accent);color:#fff;border:none;padding:3px 10px;
+  border-radius:8px;font-size:11px;cursor:pointer;font-weight:500;
+  -webkit-tap-highlight-color:rgba(88,166,255,0.3);
+}
+#refreshBtn:active{opacity:0.8}
 
 /* === Stats Row === */
 .stats-row{
@@ -349,10 +369,16 @@ a:hover{text-decoration:underline}
 
 <!-- Header -->
 <div class="header">
-  <h1>📈 股票实时追踪</h1>
-  <div class="header-right">
-    <span class="status-badge" id="marketBadge"><span class="dot yellow"></span> --</span>
-    <span id="updateTime"></span>
+  <div class="header-top">
+    <h1>📈 股票实时追踪</h1>
+    <div class="header-right">
+      <span class="status-badge" id="marketBadge"><span class="dot yellow"></span> --</span>
+    </div>
+  </div>
+  <div class="header-status">
+    <span id="updateTime">加载中...</span>
+    <span id="dataFreshness"></span>
+    <button id="refreshBtn" onclick="refreshData()">⟳ 刷新</button>
   </div>
 </div>
 
@@ -413,6 +439,10 @@ a:hover{text-decoration:underline}
 var allStocks = [];
 var ws = null;
 var currentTab = 'tabRanking';
+var lastDataTime = null;
+var dataAgeCheckInterval = null;
+var wsReconnectDelay = 3000;
+var isManualRefresh = false;
 
 // === Tab Switching ===
 function switchTab(tabId) {
@@ -436,18 +466,64 @@ function showToast(msg) {
   setTimeout(function(){t.classList.remove('show')},2000);
 }
 
+// === Manual Refresh ===
+function refreshData() {
+  isManualRefresh = true;
+  fetchRankings();
+  if(ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type:'ping'}));
+  } else {
+    connectWS();
+  }
+  setTimeout(function(){isManualRefresh = false}, 5000);
+}
+
+// === Update freshness indicator ===
+function updateFreshness() {
+  if(!lastDataTime) {
+    document.getElementById('dataFreshness').textContent = '⏳ 等待数据';
+    document.getElementById('dataFreshness').className = 'stale';
+    return;
+  }
+  var age = (Date.now() - lastDataTime.getTime()) / 1000;
+  var el = document.getElementById('dataFreshness');
+  if(age < 120) {
+    el.textContent = '● 数据最新';
+    el.className = 'fresh';
+  } else if(age < 600) {
+    el.textContent = '● 数据 '+Math.floor(age/60)+'分钟前';
+    el.className = 'stale';
+  } else {
+    el.textContent = '⚠ 数据 '+Math.floor(age/60)+'分钟前';
+    el.className = 'error';
+  }
+}
+setInterval(updateFreshness, 15000);
+
 // === Fetch Rankings ===
 function fetchRankings() {
   var listEl = document.getElementById('stockList');
-  listEl.innerHTML = '<div class="loading"><div class="spinner"></div><br>加载排名数据...</div>';
+  if(!allStocks.length) {
+    listEl.innerHTML = '<div class="loading"><div class="spinner"></div><br>加载排名数据...</div>';
+  }
   fetch('/api/ranking?limit=50')
-    .then(function(r){return r.json()})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return r.json();
+    })
     .then(function(data){
       allStocks = data.items || [];
+      lastDataTime = new Date();
+      updateFreshness();
       renderAll(allStocks);
+      if(isManualRefresh) showToast('✅ 数据已刷新');
     })
-    .catch(function(){
-      listEl.innerHTML = '<div class="error">⚠️ 连接失败<br><small>请确认后端服务已启动</small></div>';
+    .catch(function(err){
+      if(!allStocks.length) {
+        listEl.innerHTML = '<div class="error">⚠️ 网络连接失败<br><small>请检查服务器是否运行，或下拉刷新重试</small><br><button onclick="refreshData()" style="margin-top:12px;padding:8px 24px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">🔄 点此重试</button></div>';
+      }
+      document.getElementById('dataFreshness').textContent = '⚠ 连接失败';
+      document.getElementById('dataFreshness').className = 'error';
     });
 }
 
@@ -457,6 +533,7 @@ function renderAll(stocks) {
   renderDesktopTable(stocks);
   renderStats(stocks);
   updateAbout();
+  updateFreshness();
 }
 
 // === Stats Row ===
@@ -476,7 +553,7 @@ function renderStats(stocks) {
 function renderMobileCards(stocks) {
   var el = document.getElementById('stockList');
   if(!stocks.length){
-    el.innerHTML = '<div class="loading">⏳ 等待数据...<br><small>首次启动需要约60秒采集行情并评分</small></div>';
+    el.innerHTML = '<div class="loading">⏳ 等待数据...<br><small>首次启动约需60-90秒采集行情并评分<br>若长时间无数据，请点击刷新按钮</small><br><button onclick="refreshData()" style="margin-top:12px;padding:8px 24px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">🔄 立即刷新</button></div>';
     return;
   }
   var sigNames = {strong_buy:'强烈买入',buy:'买入',hold:'持有',weak_hold:'观望',sell:'卖出'};
@@ -635,39 +712,57 @@ function updateAbout() {
 
 // === WebSocket ===
 function connectWS() {
+  if(ws) {
+    try { ws.close(); } catch(e){}
+  }
   var protocol = location.protocol==='https:'?'wss:':'ws:';
   ws = new WebSocket(protocol+'//'+location.host+'/ws/live');
   ws.onopen = function(){
-    document.getElementById('marketBadge').innerHTML = '<span class="dot green"></span> 实时连接';
+    var badge = document.getElementById('marketBadge');
+    badge.innerHTML = '<span class="dot green"></span> 实时连接';
+    updateFreshness();
+    // 重置重连延迟
+    wsReconnectDelay = 3000;
   };
   ws.onmessage = function(e){
     var msg = JSON.parse(e.data);
     if(msg.type==='ranking_snapshot'&&msg.data){
       allStocks = msg.data;
+      lastDataTime = new Date(msg.timestamp);
       if(currentTab==='tabRanking') renderAll(msg.data);
       else if(currentTab==='tabSearch'){
         var q = document.getElementById('searchInput').value.toLowerCase().trim();
         renderSearch(q?allStocks.filter(function(s){return s.code.toLowerCase().includes(q)||(s.name||'').toLowerCase().includes(q)}):allStocks);
       }
       var now = new Date(msg.timestamp);
-      document.getElementById('updateTime').textContent = '更新 '+now.toLocaleTimeString();
-      document.getElementById('updateTime').style.display = 'inline';
+      document.getElementById('updateTime').textContent = '🕐 更新 '+now.toLocaleTimeString();
+      updateFreshness();
       renderStats(allStocks);
       updateAbout();
     } else if(msg.type==='market_status'){
-      var names = {open:'交易中',lunch_break:'午间休市',closed:'已收盘'};
+      var names = {open:'🟢 交易中',lunch_break:'🟡 午间休市',closed:'⚫ 已收盘'};
       var statusName = names[msg.status]||msg.status;
       var dotColor = msg.status==='open'?'green':msg.status==='lunch_break'?'yellow':'red';
       document.getElementById('marketBadge').innerHTML = '<span class="dot '+dotColor+'"></span> '+statusName;
+      // 非交易时段提示
+      if(msg.status==='closed' && allStocks.length > 0) {
+        var el = document.getElementById('updateTime');
+        if(el.textContent.indexOf('收盘数据') === -1) {
+          el.textContent += ' (收盘数据)';
+        }
+      }
     } else if(msg.type==='alert'){
       showToast('🚨 '+msg.message+' - '+msg.code);
     }
   };
   ws.onclose = function(){
     document.getElementById('marketBadge').innerHTML = '<span class="dot red"></span> 连接断开';
-    document.getElementById('updateTime').style.display = 'none';
     updateAbout();
-    setTimeout(connectWS,3000);
+    // 指数退避重连
+    setTimeout(function(){
+      connectWS();
+      wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, 30000);
+    }, wsReconnectDelay);
   };
   ws.onerror = function(){
     updateAbout();
@@ -691,7 +786,7 @@ document.addEventListener('touchmove',function(e){
 document.addEventListener('touchend',function(){
   if(pullEl&&window.scrollY===0){
     pullEl.textContent='⟳ 刷新中...';
-    fetchRankings();
+    refreshData();
     setTimeout(function(){if(pullEl)pullEl.remove();pullEl=null},1000);
   }else if(pullEl){pullEl.remove();pullEl=null}
 });
@@ -699,13 +794,40 @@ document.addEventListener('touchend',function(){
 // === Init ===
 fetchRankings();
 connectWS();
-// fallback polling
-setInterval(function(){if(!ws||ws.readyState!==WebSocket.OPEN)fetchRankings()},30000);
+// fallback polling - 当WebSocket断开时用HTTP轮询
+setInterval(function(){
+  if(!ws || ws.readyState !== WebSocket.OPEN) {
+    fetchRankings();
+  }
+}, 30000);
+
+// === PWA Install Detection ===
+var isStandalone = window.matchMedia('(display-mode: standalone)').matches ||
+                   navigator.standalone ||
+                   document.referrer.includes('android-app://');
+if(isStandalone) {
+  document.body.classList.add('standalone-mode');
+}
+
+// Listen for display-mode changes
+window.matchMedia('(display-mode: standalone)').addEventListener('change', function(e) {
+  if(e.matches) document.body.classList.add('standalone-mode');
+  else document.body.classList.remove('standalone-mode');
+});
 
 // === Service Worker Registration ===
 if('serviceWorker' in navigator){
   navigator.serviceWorker.register('/sw.js').then(function(reg){
     console.log('SW registered:', reg.scope);
+    // 检查是否有更新
+    reg.addEventListener('updatefound', function(){
+      var newWorker = reg.installing;
+      newWorker.addEventListener('statechange', function(){
+        if(newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+          showToast('🔄 新版本可用，刷新页面即可更新');
+        }
+      });
+    });
   }).catch(function(err){
     console.log('SW registration failed:', err);
   });
@@ -715,38 +837,42 @@ if('serviceWorker' in navigator){
 </html>"""
 
 
-SW_JS = """const CACHE_NAME = 'stock-tracker-v2';
-const ASSETS_TO_CACHE = [
+SW_JS = """const CACHE_NAME = 'stock-tracker-v3';
+const STATIC_ASSETS = [
   '/',
   '/manifest.json',
   '/favicon.svg',
-  '/api/health',
+  '/icons/icon-192.png',
+  '/icons/icon-512.png',
 ];
 
-// Install: pre-cache core assets
+// Install: pre-cache static assets
 self.addEventListener('install', function(event) {
   event.waitUntil(
     caches.open(CACHE_NAME).then(function(cache) {
-      console.log('SW: Caching core assets');
-      return cache.addAll(ASSETS_TO_CACHE).catch(function(err) {
-        console.log('SW: Cache addAll error (some may be API calls):', err);
+      console.log('SW: Caching static assets');
+      return cache.addAll(STATIC_ASSETS).catch(function(err) {
+        console.log('SW: Cache addAll error (non-fatal):', err);
       });
     })
   );
   self.skipWaiting();
 });
 
-// Activate: clean old caches
+// Activate: clean old caches, claim clients
 self.addEventListener('activate', function(event) {
   event.waitUntil(
     caches.keys().then(function(keys) {
-      return Promise.all(keys.filter(function(k) { return k !== CACHE_NAME; }).map(function(k) { return caches.delete(k); }));
+      return Promise.all(
+        keys.filter(function(k) { return k !== CACHE_NAME; })
+            .map(function(k) { console.log('SW: Deleting old cache', k); return caches.delete(k); })
+      );
     })
   );
   self.clients.claim();
 });
 
-// Fetch: network-first for API, cache-first for static
+// Fetch: network-first with cache fallback
 self.addEventListener('fetch', function(event) {
   var url = new URL(event.request.url);
 
@@ -758,15 +884,20 @@ self.addEventListener('fetch', function(event) {
     event.respondWith(
       fetch(event.request)
         .then(function(response) {
-          var cloned = response.clone();
-          caches.open(CACHE_NAME).then(function(cache) {
-            cache.put(event.request, cloned);
-          });
+          // 只缓存成功的响应
+          if (response.ok) {
+            var cloned = response.clone();
+            caches.open(CACHE_NAME).then(function(cache) {
+              cache.put(event.request, cloned);
+            });
+          }
           return response;
         })
         .catch(function() {
           return caches.match(event.request).then(function(cached) {
-            return cached || new Response(JSON.stringify({error:'offline'}), {
+            if (cached) return cached;
+            // 离线时返回友好错误
+            return new Response(JSON.stringify({error:'offline', message:'当前无网络连接，请联网后重试'}), {
               status: 503,
               headers: {'Content-Type': 'application/json'}
             });
@@ -776,30 +907,73 @@ self.addEventListener('fetch', function(event) {
     return;
   }
 
-  // Static assets + page: cache-first
+  // Static assets: cache-first, network fallback
   event.respondWith(
     caches.match(event.request).then(function(cached) {
-      return cached || fetch(event.request).then(function(response) {
-        var cloned = response.clone();
-        caches.open(CACHE_NAME).then(function(cache) {
-          cache.put(event.request, cloned);
-        });
+      if (cached) return cached;
+      return fetch(event.request).then(function(response) {
+        if (response.ok) {
+          var cloned = response.clone();
+          caches.open(CACHE_NAME).then(function(cache) {
+            cache.put(event.request, cloned);
+          });
+        }
         return response;
       });
+    })
+  );
+});
+
+// 推送通知（预留）
+self.addEventListener('push', function(event) {
+  var data = event.data ? event.data.json() : {};
+  var title = data.title || '股票追踪';
+  var options = {
+    body: data.body || '',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    vibrate: [200, 100, 200],
+    data: { url: data.url || '/' }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener('notificationclick', function(event) {
+  event.notification.close();
+  event.waitUntil(
+    clients.matchAll({type: 'window'}).then(function(clientList) {
+      for (var i = 0; i < clientList.length; i++) {
+        var client = clientList[i];
+        if (client.url && 'focus' in client) return client.focus();
+      }
+      if (clients.openWindow) return clients.openWindow('/');
     })
   );
 });"""
 
 MANIFEST_JSON = {
-    "name": "A股实时追踪 - 高价值股智能评分",
+    "name": "A股实时追踪",
     "short_name": "股票追踪",
     "description": "实时追踪A股市场，综合技术分析、新闻情绪、资金流向多维度智能评分",
-    "start_url": "/",
+    "start_url": "/?utm_source=pwa",
     "display": "standalone",
+    "display_override": ["standalone", "minimal-ui"],
     "orientation": "portrait-primary",
     "theme_color": "#0d1117",
     "background_color": "#0d1117",
     "icons": [
+        {
+            "src": "/icons/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any"
+        },
+        {
+            "src": "/icons/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any maskable"
+        },
         {
             "src": "/favicon.svg",
             "sizes": "any",
@@ -808,7 +982,17 @@ MANIFEST_JSON = {
         }
     ],
     "categories": ["finance", "utilities"],
-    "lang": "zh-CN"
+    "lang": "zh-CN",
+    "prefer_related_applications": False,
+    "shortcuts": [
+        {
+            "name": "查看排名",
+            "short_name": "排名",
+            "description": "查看Top50股票排名",
+            "url": "/?tab=ranking",
+            "icons": [{"src": "/icons/icon-192.png", "sizes": "192x192"}]
+        }
+    ]
 }
 
 FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
@@ -826,6 +1010,128 @@ FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
   <line x1="50" y1="70" x2="50" y2="86" stroke="#3fb950" stroke-width="2.5" stroke-linecap="round"/>
   <line x1="65" y1="76" x2="65" y2="82" stroke="#3fb950" stroke-width="2.5" stroke-linecap="round"/>
 </svg>"""
+
+
+# PWA图标生成和存储
+ICONS_DIR = DATA_DIR / "icons"
+ICONS_DIR.mkdir(exist_ok=True)
+
+
+def _generate_png_icon(size: int, filepath: Path):
+    """
+    使用Pillow生成PNG图标 - 股票图表主题
+    size: 图标尺寸 (如 192, 512)
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.new("RGBA", (size, size), (13, 17, 23, 255))  # #0d1117
+    draw = ImageDraw.Draw(img)
+
+    margin = size // 8
+    w, h = size - 2 * margin, size - 2 * margin
+
+    # 上涨K线 (红色)
+    candle_w = max(1, w // 20)
+    gap = max(1, w // 25)
+
+    # 画几个K线柱
+    candles = [
+        (0.15, 0.6, 0.2, "up"),    # 阳线
+        (0.28, 0.45, 0.65, "up"),  # 大阳线
+        (0.40, 0.55, 0.35, "up"),  # 阳线
+        (0.52, 0.5, 0.55, "up"),   # 阳线
+        (0.64, 0.35, 0.7, "up"),   # 大阳线
+        (0.76, 0.48, 0.6, "up"),   # 阳线
+    ]
+
+    for cx, low_h, high_h, ctype in candles:
+        x = margin + int(w * cx)
+
+        # 影线
+        y_low = margin + int(h * low_h)
+        y_high = margin + int(h * (1 - high_h))
+        y_body_low = margin + int(h * (low_h + 0.1))
+        y_body_high = margin + int(h * (1 - (high_h + 0.05)))
+
+        # 画影线
+        draw.line([(x, y_low), (x, y_high)], fill=(200, 200, 210, 255), width=max(1, size // 300))
+
+        # 画实体 (红涨 = #ff6b6b)
+        body_color = (255, 107, 107, 255)
+        draw.rectangle(
+            [x - candle_w, y_body_high, x + candle_w, y_body_low],
+            fill=body_color
+        )
+
+    # 均线 (MA5 - 金色)
+    ma_points = []
+    for i in range(w):
+        px = margin + i
+        t = i / max(w - 1, 1)
+        # 模拟一条上升均线
+        py = margin + int(h * (0.65 - 0.3 * t + 0.05 * (3 * t * (1 - t))))
+        ma_points.append((px, py))
+
+    for i in range(len(ma_points) - 1):
+        draw.line([ma_points[i], ma_points[i + 1]], fill=(255, 200, 50, 200), width=max(1, size // 200))
+
+    # 底部标题
+    try:
+        # 尝试使用系统字体
+        font_size = size // 8
+        font = ImageFont.truetype("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", font_size)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+    # 文字: A股
+    text_bbox = draw.textbbox((0, 0), "A股", font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    draw.text(
+        (size // 2 - text_w // 2, size - margin // 2 - text_h),
+        "A股",
+        fill=(200, 210, 220, 255),
+        font=font
+    )
+
+    img.save(filepath, "PNG")
+    logger.info(f"PWA图标已生成: {filepath} ({size}x{size})")
+
+
+def _ensure_pwa_icons():
+    """确保PWA图标存在，不存在则生成"""
+    icon_192 = ICONS_DIR / "icon-192.png"
+    icon_512 = ICONS_DIR / "icon-512.png"
+
+    if not icon_192.exists():
+        _generate_png_icon(192, icon_192)
+    if not icon_512.exists():
+        _generate_png_icon(512, icon_512)
+
+
+# PWA图标服务
+@app.get("/icons/{filename}")
+async def serve_icon(filename: str):
+    """提供PWA图标"""
+    filepath = ICONS_DIR / filename
+    if not filepath.exists() or not filepath.is_file():
+        # 回退到SVG favicon
+        return Response(content=FAVICON_SVG, media_type="image/svg+xml")
+
+    media_types = {
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon",
+    }
+    ext = filepath.suffix.lower()
+    return Response(
+        content=filepath.read_bytes(),
+        media_type=media_types.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=86400"}
+    )
 
 
 # 保活端点（防止免费云服务休眠）

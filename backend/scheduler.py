@@ -39,12 +39,13 @@ def _now_str() -> str:
 
 async def _run_realtime_cycle():
     """
-    实时数据循环 (5秒一次, 仅交易时段)
+    实时数据循环 (60秒一次)
     1. 获取全A股实时行情
     2. 筛选候选股
-    3. 计算技术指标
-    4. 运行评分
-    5. WebSocket推送排名
+    3. 补充历史数据（首次）
+    4. 计算技术指标
+    5. 运行评分
+    6. WebSocket推送排名
     """
     try:
         is_trading = is_trading_time()
@@ -71,6 +72,25 @@ async def _run_realtime_cycle():
         # Step 2: 筛选候选股
         candidate_codes = await get_candidate_codes(CANDIDATE_COUNT)
         logger.debug(f"候选股: {len(candidate_codes)} 只")
+
+        # Step 2.5: 检查并补充历史数据（首次启动时关键！）
+        from backend.collectors.historical import seed_history_for_codes, load_history_to_cache
+        from backend.utils.cache import history_cache
+
+        # 加载已有的历史数据到缓存
+        new_codes = [c for c in candidate_codes if c not in history_cache]
+        if new_codes:
+            await load_history_to_cache(new_codes)
+
+        # 如果候选股还没有历史数据，增量获取
+        still_missing = [c for c in candidate_codes if c not in history_cache]
+        if still_missing:
+            logger.info(f"候选股中 {len(still_missing)} 只缺少历史数据，开始补充...")
+            # 分批获取，避免一次性请求太多
+            batch_size = 5
+            for i in range(0, min(len(still_missing), 20), batch_size):
+                batch = still_missing[i:i + batch_size]
+                await seed_history_for_codes(batch, max_concurrent=3, days=60)
 
         # Step 3-4: 运行评分（交易时段和非交易时段都运行）
         rankings = await run_scoring_pipeline(candidate_codes)
