@@ -1034,46 +1034,48 @@ def _generate_png_icon(size: int, filepath: Path):
     candle_w = max(1, w // 20)
     gap = max(1, w // 25)
 
-    # 画几个K线柱
+    # 画K线柱 (每根: x位置%, 影线底%, 实体底%, 实体顶%, 影线顶%)
+    # 百分比从顶部算起，所以 小% = 靠近顶部(高价), 大% = 靠近底部(低价)
     candles = [
-        (0.15, 0.6, 0.2, "up"),    # 阳线
-        (0.28, 0.45, 0.65, "up"),  # 大阳线
-        (0.40, 0.55, 0.35, "up"),  # 阳线
-        (0.52, 0.5, 0.55, "up"),   # 阳线
-        (0.64, 0.35, 0.7, "up"),   # 大阳线
-        (0.76, 0.48, 0.6, "up"),   # 阳线
+        (0.15, 0.65, 0.55, 0.40, "up"),   # 阳线
+        (0.28, 0.70, 0.58, 0.35, "up"),   # 大阳线
+        (0.40, 0.60, 0.50, 0.38, "up"),   # 阳线
+        (0.52, 0.55, 0.48, 0.36, "up"),   # 阳线
+        (0.64, 0.72, 0.60, 0.32, "up"),   # 大阳线
+        (0.76, 0.62, 0.52, 0.39, "up"),   # 阳线
     ]
 
-    for cx, low_h, high_h, ctype in candles:
+    for cx, wick_bot, body_bot, body_top, wick_top, ctype in candles:
         x = margin + int(w * cx)
 
-        # 影线
-        y_low = margin + int(h * low_h)
-        y_high = margin + int(h * (1 - high_h))
-        y_body_low = margin + int(h * (low_h + 0.1))
-        y_body_high = margin + int(h * (1 - (high_h + 0.05)))
+        # 像素坐标 (y向下增长)
+        y_wick_bot = margin + int(h * wick_bot)
+        y_body_bot = margin + int(h * body_bot)
+        y_body_top = margin + int(h * body_top)
+        y_wick_top = margin + int(h * wick_top)
 
-        # 画影线
-        draw.line([(x, y_low), (x, y_high)], fill=(200, 200, 210, 255), width=max(1, size // 300))
+        # 画影线 (细线)
+        draw.line([(x, y_wick_top), (x, y_wick_bot)], fill=(200, 200, 210, 255), width=max(1, size // 300))
 
-        # 画实体 (红涨 = #ff6b6b)
+        # 画实体 (红涨 = #ff6b6b), y_body_top < y_body_bot
         body_color = (255, 107, 107, 255)
         draw.rectangle(
-            [x - candle_w, y_body_high, x + candle_w, y_body_low],
+            [x - candle_w, y_body_top, x + candle_w, y_body_bot],
             fill=body_color
         )
 
-    # 均线 (MA5 - 金色)
-    ma_points = []
-    for i in range(w):
-        px = margin + i
-        t = i / max(w - 1, 1)
-        # 模拟一条上升均线
-        py = margin + int(h * (0.65 - 0.3 * t + 0.05 * (3 * t * (1 - t))))
-        ma_points.append((px, py))
-
-    for i in range(len(ma_points) - 1):
-        draw.line([ma_points[i], ma_points[i + 1]], fill=(255, 200, 50, 200), width=max(1, size // 200))
+    # 均线 (MA5 - 金色，从左下到右上)
+    line_y_start = margin + int(h * 0.62)
+    line_y_end = margin + int(h * 0.35)
+    steps = 20
+    for i in range(steps):
+        t = i / steps
+        x1 = margin + int(w * t)
+        y1 = int(line_y_start + (line_y_end - line_y_start) * t)
+        t2 = (i + 1) / steps
+        x2 = margin + int(w * t2)
+        y2 = int(line_y_start + (line_y_end - line_y_start) * t2)
+        draw.line([(x1, y1), (x2, y2)], fill=(255, 200, 50, 200), width=max(1, size // 150))
 
     # 底部标题
     try:
