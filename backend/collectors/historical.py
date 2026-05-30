@@ -16,36 +16,91 @@ from backend.config import HISTORY_DAYS
 CST = ZoneInfo("Asia/Shanghai")
 
 
+def _get_market_prefix(code: str) -> str:
+    """根据股票代码返回腾讯API市场前缀"""
+    code = str(code).strip()
+    if code.startswith(("6", "9")):
+        return "sh"
+    elif code.startswith(("0", "3")):
+        return "sz"
+    elif code.startswith(("4", "8")):
+        return "bj"
+    else:
+        return "sz"
+
+
+def _parse_tencent_kline(raw_data: list, code: str) -> pd.DataFrame | None:
+    """
+    解析腾讯K线API返回数据
+    格式: [日期, 开盘, 收盘, 最高, 最低, 成交量]
+    """
+    if not raw_data:
+        return None
+
+    rows = []
+    for item in raw_data:
+        if len(item) < 6:
+            continue
+        try:
+            rows.append({
+                "日期": item[0],
+                "开盘": float(item[1]),
+                "收盘": float(item[2]),
+                "最高": float(item[3]),
+                "最低": float(item[4]),
+                "成交量": float(item[5]),
+            })
+        except (ValueError, TypeError, IndexError):
+            continue
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    # 按日期升序排列
+    df = df.sort_values("日期").reset_index(drop=True)
+    return df
+
+
 @sync_with_retry()
 def _fetch_history_sync(code: str, period: str = "daily", days: int = HISTORY_DAYS) -> pd.DataFrame | None:
-    """同步获取单只股票历史K线"""
-    import akshare as ak
-    from datetime import timedelta
+    """
+    同步获取单只股票历史K线
+    使用腾讯K线API (qt.gtimg.cn)，阿里云ECS可正常访问
+    """
+    import urllib.request
+    import json
 
     try:
-        # 根据股票代码判断市场
-        if code.startswith("6"):
-            adjust = "qfq"  # 前复权
-        else:
-            adjust = "qfq"
+        prefix = _get_market_prefix(code)
+        symbol = f"{prefix}{code}"
 
-        end_date = datetime.now(CST).date()
-        start_date = (end_date - timedelta(days=days + 10)).isoformat()  # 多拿10天，含非交易日
-
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period=period,
-            start_date=start_date,
-            end_date=end_date.isoformat(),
-            adjust=adjust
+        # 腾讯前复权日K线API
+        url = (
+            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            f"?param={symbol},day,,,{days},qfq"
         )
 
-        # akshare返回的列名可能是中文
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gu.qq.com/",
+        })
+
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        # 解析K线数据
+        stock_data = data.get("data", {}).get(symbol, {})
+        klines = stock_data.get("day", []) or stock_data.get("qfqday", [])
+
+        if not klines:
+            logger.debug(f"腾讯K线API返回空数据: {code}")
+            return None
+
+        df = _parse_tencent_kline(klines, code)
         if df is not None and not df.empty:
-            # 取最近N天
-            df = df.tail(days)
-            return df
-        return None
+            logger.debug(f"获取 {code} 历史数据: {len(df)} 条")
+        return df
 
     except Exception as e:
         logger.debug(f"获取 {code} 历史数据失败: {e}")
