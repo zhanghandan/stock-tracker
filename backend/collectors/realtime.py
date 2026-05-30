@@ -22,8 +22,13 @@ SINA_API = "https://hq.sinajs.cn/list={symbols}"
 # 腾讯实时行情API (备选)
 TENCENT_API = "https://qt.gtimg.cn/q={symbols}"
 
-# HTTP请求头
-HEADERS = {
+# HTTP请求头 - 腾讯
+TENCENT_HEADERS = {
+    "Referer": "https://gu.qq.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
+# HTTP请求头 - 新浪(备)
+SINA_HEADERS = {
     "Referer": "https://finance.sina.com.cn",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
@@ -113,38 +118,132 @@ def _parse_float(val: str) -> float | None:
         return None
 
 
+def _build_tencent_symbols(codes: list[str]) -> str:
+    """构建腾讯股票代码格式: sh600519,sz000001"""
+    symbols = []
+    for code in codes:
+        code = str(code).strip()
+        if code.startswith("6") or code.startswith("9"):
+            symbols.append(f"sh{code}")
+        elif code.startswith(("0", "3")):
+            symbols.append(f"sz{code}")
+        elif code.startswith(("4", "8")):
+            symbols.append(f"bj{code}")
+        else:
+            symbols.append(f"sz{code}")
+    return ",".join(symbols)
+
+
+def _parse_tencent_response(text: str) -> list[dict]:
+    """
+    解析腾讯实时行情响应
+    格式: v_sh600519="1~贵州茅台~600519~1326.00~1275.98~..."
+    字段: 市场~名称~代码~现价~昨收~今开~成交量(手)~买一~卖一~...
+    索引: 0~1~2~3~4~5~6~7~31(时间)
+    """
+    results = []
+    # 先尝试用GBK解码
+    try:
+        text = text.encode('latin-1').decode('gbk')
+    except Exception:
+        try:
+            text = text.encode('latin-1').decode('gb2312')
+        except Exception:
+            pass
+
+    pattern = r'v_(\w+)="([^"]*)"'
+    matches = re.findall(pattern, text)
+
+    for symbol, data_str in matches:
+        if not data_str:
+            continue
+
+        parts = data_str.split("~")
+        if len(parts) < 10:
+            continue
+
+        code = symbol[2:] if len(symbol) > 2 else symbol
+
+        try:
+            result = {
+                "code": code,
+                "name": parts[1],
+                "latest_price": _parse_float(parts[3]),   # 现价
+                "prev_close": _parse_float(parts[4]),      # 昨收
+                "open": _parse_float(parts[5]),            # 今开
+                "volume_hands": _parse_float(parts[6]),    # 成交量(手)
+                "high": _parse_float(parts[33]) if len(parts) > 33 else None,
+                "low": _parse_float(parts[34]) if len(parts) > 34 else None,
+                "turnover_yuan": _parse_float(parts[37]) if len(parts) > 37 else None,
+                "time": parts[30] if len(parts) > 30 else "",
+            }
+
+            if result["latest_price"] is not None and result["prev_close"] is not None and result["prev_close"] > 0:
+                result["change_amount"] = round(result["latest_price"] - result["prev_close"], 3)
+                result["change_pct"] = round((result["latest_price"] - result["prev_close"]) / result["prev_close"] * 100, 2)
+            else:
+                result["change_amount"] = None
+                result["change_pct"] = None
+
+            if result["high"] is not None and result["low"] is not None and result["prev_close"] is not None and result["prev_close"] > 0:
+                result["amplitude"] = round((result["high"] - result["low"]) / result["prev_close"] * 100, 2)
+            else:
+                result["amplitude"] = None
+
+            results.append(result)
+        except Exception as e:
+            logger.debug(f"解析腾讯股票数据失败 {symbol}: {e}")
+            continue
+
+    return results
+
+
 async def fetch_realtime_batch(codes: list[str], batch_size: int = 500) -> list[dict]:
     """
     分批获取个股实时行情
-    新浪API每次最多支持约800只股票
+    优先使用腾讯API，失败后降级到新浪API
     """
     all_results = []
     chunks = [codes[i:i + batch_size] for i in range(0, len(codes), batch_size)]
 
-    async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+    # 优先尝试腾讯API
+    async with httpx.AsyncClient(timeout=15.0, headers=TENCENT_HEADERS) as client:
         for chunk in chunks:
             try:
-                symbols = _build_sina_symbols(chunk)
-                url = SINA_API.format(symbols=symbols)
+                symbols = _build_tencent_symbols(chunk)
+                url = TENCENT_API.format(symbols=symbols)
 
                 resp = await client.get(url)
                 if resp.status_code == 200:
-                    # 需要正确解码（新浪返回GBK编码）
+                    text = resp.text
+                    if "v_" in text and "~" in text:
+                        results = _parse_tencent_response(text)
+                        all_results.extend(results)
+                        logger.debug(f"腾讯API获取行情: {len(results)}/{len(chunk)} 只")
+                        await asyncio.sleep(0.2)
+                        continue
+                    else:
+                        logger.debug(f"腾讯API返回异常: {text[:80]}")
+                else:
+                    logger.debug(f"腾讯API HTTP {resp.status_code}，降级到新浪")
+            except Exception as e:
+                logger.debug(f"腾讯API异常: {e}")
+                pass
+
+            # 降级：尝试新浪API
+            try:
+                sina_symbols = _build_sina_symbols(chunk)
+                sina_url = SINA_API.format(symbols=sina_symbols)
+                resp = await client.get(sina_url, headers=SINA_HEADERS)
+                if resp.status_code == 200:
                     text = resp.text
                     if "hq_str_" in text:
                         results = _parse_sina_response(text)
                         all_results.extend(results)
-                        logger.debug(f"获取行情: {len(results)}/{len(chunk)} 只")
-                    else:
-                        logger.warning(f"新浪API返回异常数据: {text[:100]}")
-                else:
-                    logger.warning(f"新浪API HTTP错误: {resp.status_code}")
-
-                # 批次间短暂休息
+                        logger.debug(f"新浪API获取行情: {len(results)}/{len(chunk)} 只")
                 await asyncio.sleep(0.3)
-
             except Exception as e:
-                logger.warning(f"获取行情批次失败: {e}")
+                logger.warning(f"所有API获取批次失败: {e}")
                 continue
 
     return all_results
