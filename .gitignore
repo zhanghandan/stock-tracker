@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Database
+data/
+*.db
+
+# Logs
+logs/
+*.log
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/dist_react/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

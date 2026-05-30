@@ -1,0 +1,20 @@
+{
+  "name": "A股实时追踪 - 高价值股智能评分",
+  "short_name": "股票追踪",
+  "description": "实时追踪A股市场，综合技术分析、新闻情绪、资金流向多维度智能评分",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#0d1117",
+  "background_color": "#0d1117",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "utilities"],
+  "lang": "zh-CN"
+}
