@@ -1136,7 +1136,7 @@ async def serve_icon(filename: str):
     )
 
 
-# 保活端点（防止免费云服务休眠）
+# ===== 保活端点 =====
 @app.get("/ping")
 async def ping():
     """Keepalive endpoint for free tier services"""

@@ -166,3 +166,31 @@ class SystemState(Base):
     updated_at: Mapped[str] = mapped_column(
         String(30), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
+
+
+class User(Base):
+    """用户表"""
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(11), unique=True, nullable=False, comment="手机号")
+    nickname: Mapped[str] = mapped_column(String(50), nullable=True, comment="昵称")
+    avatar: Mapped[str] = mapped_column(String(200), nullable=True, comment="头像")
+    created_at: Mapped[str] = mapped_column(
+        String(30), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+    last_login: Mapped[str] = mapped_column(String(30), nullable=True, comment="最后登录时间")
+
+
+class VerificationCode(Base):
+    """短信验证码"""
+    __tablename__ = "verification_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(11), nullable=False, comment="手机号")
+    code: Mapped[str] = mapped_column(String(6), nullable=False, comment="验证码")
+    used: Mapped[int] = mapped_column(Integer, default=0, server_default="0", comment="是否已使用")
+    expires_at: Mapped[str] = mapped_column(String(30), nullable=False, comment="过期时间")
+    created_at: Mapped[str] = mapped_column(
+        String(30), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )

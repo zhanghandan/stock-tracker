@@ -170,6 +170,55 @@ async def _run_eod_sync():
         logger.error(f"盘后同步异常: {e}")
 
 
+async def _run_ai_analysis_cycle():
+    """
+    AI分析循环 (每5分钟)
+    1. 生成市场总结
+    2. 对Top股票做深度AI分析
+    3. 异常检测
+    """
+    from backend.config import AI_STOCK_ANALYSIS_COUNT
+    from backend.ai.analyst import generate_market_summary, detect_anomalies
+    from backend.ai.news_sentiment import batch_ai_sentiment
+    from backend.scoring.engine import get_top_rankings
+    from backend.api.websocket import ws_manager
+
+    try:
+        rankings = await get_top_rankings(limit=50)
+        if not rankings:
+            return
+
+        status = get_market_status()
+
+        # 市场总结
+        summary_data = [{
+            'code': r['code'], 'name': r['name'],
+            'composite_score': r['composite_score'], 'technical_score': r['technical_score'],
+            'change_pct': r['change_pct'], 'technical_signal': r['technical_signal']
+        } for r in rankings]
+
+        await generate_market_summary(summary_data, status)
+
+        # 异常检测
+        anomalies = await detect_anomalies(summary_data)
+        if anomalies:
+            for a in anomalies[:3]:
+                await ws_manager.send_alert(
+                    level="info",
+                    message=f"[AI检测] {a.get('alert', '')}",
+                    code=a.get('code', ''),
+                )
+
+        # 对Top10股票做AI新闻情绪分析
+        top_codes = [r['code'] for r in rankings[:AI_STOCK_ANALYSIS_COUNT]]
+        await batch_ai_sentiment(top_codes)
+
+        logger.info(f"AI分析周期完成: 异常{len(anomalies)}个, 情绪分析{len(top_codes)}只")
+
+    except Exception as e:
+        logger.error(f"AI分析循环异常: {e}")
+
+
 def setup_scheduler():
     """配置并启动调度器"""
 
@@ -212,6 +261,19 @@ def setup_scheduler():
         name="盘后K线同步",
         max_instances=1,
     )
+
+    # Job 5: AI分析 (每5分钟, 如果启用)
+    from backend.config import AI_ANALYSIS_ENABLED
+    if AI_ANALYSIS_ENABLED:
+        scheduler.add_job(
+            _run_ai_analysis_cycle,
+            IntervalTrigger(minutes=5),
+            id="ai_analysis_cycle",
+            name="AI分析与异常检测",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("  AI分析: 已启用 (每5分钟)")
 
     # 启动
     scheduler.start()

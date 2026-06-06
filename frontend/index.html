@@ -3,11 +3,51 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>A股高价值股实时追踪系统</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>A股实时追踪</title>
+    <meta name="description" content="AI驱动的A股高价值股实时追踪与智能分析" />
+    <meta name="theme-color" content="#0a0e14" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="股票追踪" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <style>
+      /* 独立应用启动画面 */
+      body { margin: 0; background: #0a0e14; }
+      #pwa-splash {
+        position: fixed; inset: 0; background: #0a0e14;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        z-index: 99999; color: #cdd6e0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', sans-serif;
+      }
+      #pwa-splash .icon { font-size: 64px; margin-bottom: 16px; }
+      #pwa-splash h2 { font-size: 20px; margin: 0 0 4px; color: #4a5ee5; }
+      #pwa-splash p { font-size: 12px; color: #5a6470; margin: 0; }
+      #pwa-splash .loader { margin-top: 24px; width: 32px; height: 3px; border-radius: 2px; background: #262d36; overflow: hidden; }
+      #pwa-splash .loader-bar { height: 100%; width: 30%; background: #4a5ee5; animation: splash-load 1.5s ease-in-out infinite; }
+      @keyframes splash-load { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <div id="pwa-splash">
+      <div class="icon">📈</div>
+      <h2>A股实时追踪</h2>
+      <p>AI 智能分析引擎</p>
+      <div class="loader"><div class="loader-bar"></div></div>
+    </div>
+    <script>
+      // 隐藏启动画面（React挂载后自动隐藏）
+      window.addEventListener('load', function() {
+        setTimeout(function() {
+          var splash = document.getElementById('pwa-splash');
+          if (splash) { splash.style.opacity = '0'; splash.style.transition = 'opacity 0.3s'; }
+          setTimeout(function() { if (splash) splash.remove(); }, 350);
+        }, 600);
+      });
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

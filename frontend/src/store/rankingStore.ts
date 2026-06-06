@@ -23,6 +23,10 @@ export interface RankingItem {
   total_mv: number | null;
   change_60d: number | null;
   scored_at: string | null;
+  ai_rank?: number;
+  ai_reason?: string;
+  ai_risk?: string;
+  ai_advice?: string;
 }
 
 interface RankingState {

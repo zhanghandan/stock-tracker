@@ -77,6 +77,22 @@ API_TIMEOUT = 30       # 秒
 # 前端静态文件 (生产模式)
 FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 
+# DeepSeek AI配置
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# 如果环境变量未设置，尝试从文件读取
+if not DEEPSEEK_API_KEY:
+    _key_file = Path(__file__).parent.parent / ".deepseek_key"
+    if _key_file.exists():
+        DEEPSEEK_API_KEY = _key_file.read_text().strip()
+
+# AI分析配置
+AI_ANALYSIS_ENABLED = bool(DEEPSEEK_API_KEY)
+AI_MARKET_SUMMARY_INTERVAL = 300    # 市场总结刷新间隔(秒)
+AI_STOCK_ANALYSIS_COUNT = 10        # 每次深度分析Top N只
+AI_ANOMALY_CHECK_INTERVAL = 300     # 异常检测间隔(秒)
+
 # 日志配置
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} | {message}"
